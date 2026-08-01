@@ -295,7 +295,17 @@ python -m shared.db.init_db
 
 ### 3. Launch Services
 
-Run each component in a separate terminal tab:
+#### Option A: One-Click Launcher (Windows)
+Double-click [`run.bat`](file:///d:/codes/biopharma%20assessment/run.bat) in the project root (or run `run.bat` in cmd). This automatically:
+1. Checks virtual environment & `.env` configuration.
+2. Seeds `data/assets.db` if missing.
+3. Launches all 3 FastAPI backends (ports 8001, 8002, 8003) and Streamlit (port 8501) in separate windows.
+4. Opens `http://localhost:8501` in your browser.
+
+To stop all services, double-click [`stop.bat`](file:///d:/codes/biopharma%20assessment/stop.bat).
+
+#### Option B: Manual Multi-Terminal Setup
+Run each component in a separate terminal:
 
 ```bash
 # Terminal 1: Backend 1 (ReAct Agent)
