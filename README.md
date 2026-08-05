@@ -28,6 +28,7 @@ Powered by **Ollama Cloud** (`gemma4:31b-cloud`) via native function calling wit
   - [3. Intent Router (`backend_router`)](#3--intent-router-backend_router-port-8003)
   - [Approach Comparison Matrix](#approach-comparison-matrix)
 - [Low-Level Execution Diagrams](#low-level-execution-diagrams)
+- [Evaluation Framework & Benchmarking](#evaluation-framework--benchmarking)
 - [Authentication & Security Architecture](#authentication--security-architecture)
 - [Concurrency & Cloud Rate-Limiting](#concurrency--cloud-rate-limiting)
 - [Data Model & Scope Honesty](#data-model--scope-honesty)
@@ -116,6 +117,80 @@ All three backends share identical configuration, authentication, LLM client, da
 ### Approach 3 — Intent Router & DuckDB Engine
 
 ![Intent Router](images/router.png)
+
+---
+
+## Evaluation Framework & Benchmarking
+
+The project includes a deterministic evaluation engine ([`shared/eval/engine.py`](file:///d:/codes/biopharma%20assessment/shared/eval/engine.py)) and a labeled dataset ([`shared/eval/dataset.py`](file:///d:/codes/biopharma%20assessment/shared/eval/dataset.py)) to score and benchmark all three backend architectures.
+
+### Core Philosophy: Ground Truth vs. AI Opinions
+
+> [!IMPORTANT]
+> Evaluation compares each backend's answer against pre-verified database facts—**not against another AI's subjective opinion**.
+
+Because the evaluation dataset is small, fixed, and pre-verified against the underlying database, every question has known ground truth (e.g., *"Where is AST1002?"* $\rightarrow$ `"Bangalore"`). Testing against deterministic factual assertions ensures objective, repeatable, and zero-cost benchmarking.
+
+---
+
+### The Two Core Building Blocks
+
+1. **Labeled Dataset ([`shared/eval/dataset.py`](file:///d:/codes/biopharma%20assessment/shared/eval/dataset.py)):**
+   Each test case packages a question with ground-truth assertions from three architectural perspectives:
+   - `expect_facts`: Substring facts that **must** appear in a correct response.
+   - `forbid_facts`: Substrings that **must NOT** appear.
+   - `expect_tool` / `expect_worker` / `expect_intent`: Expected internal trace actions for Backend 1 (ReAct tool), Backend 2 (Supervisor worker), and Backend 3 (Intent Router plan).
+   - `is_honesty`: Flags out-of-scope queries (e.g., manager info).
+   - `HONESTY_MARKERS`: Pre-defined refusal markers (e.g., *"doesn't contain"*, *"not available"*) to verify honest scope boundaries.
+
+2. **Scoring Engine ([`shared/eval/engine.py`](file:///d:/codes/biopharma%20assessment/shared/eval/engine.py)):**
+   An asynchronous engine (`run_eval`) that sends questions to `/chat`, records latency, inspects internal reasoning traces, scores correctness and compliance, and aggregates results.
+
+---
+
+### Step-by-Step Evaluation per Question
+
+1. **Send & Time:** Calls the backend `/chat` endpoint and records response latency (`latency_s`).
+2. **Score Correctness (`_score_answer`):** Performs case-insensitive substring matching against `expect_facts` and verifies `forbid_facts` are absent.
+3. **Score Architecture Accuracy (`_arch_metric`):** Inspects the execution trace to confirm internal compliance:
+   - **ReAct Agent:** Checks `resp["trace"]` for `expect_tool`.
+   - **Multi-Agent Supervisor:** Checks `resp["assignments"]` for `expect_worker`.
+   - **Intent Router:** Checks `resp["plan"]["steps"]` for `expect_intent`.
+4. **Scope Honesty Verification (`_score_honesty`):** For out-of-scope questions, checks for refusal phrases in `HONESTY_MARKERS`.
+5. **JSON Validity (`_json_valid`):** Verifies if Backend 3 produced a valid, parsable intent plan.
+6. **Optional LLM Fluency Judge (`judge_fn`):** An optional secondary scoring step using an LLM to rate natural language fluency (1–5 scale).
+
+---
+
+### Aggregated Metrics Summary
+
+After evaluating all test cases, metrics are aggregated into an `EvalSummary`:
+
+| Metric | Calculation Formula | Description |
+|:---|:---|:---|
+| **Correctness** | $\frac{\text{Correct Cases}}{N}$ | Ratio of answers containing all expected ground-truth facts |
+| **Scope Honesty** | $\frac{\text{Correct Refusals}}{\text{Honesty Cases}}$ | Ratio of out-of-scope questions correctly declined |
+| **Arch Accuracy** | $\frac{\text{Correct Internal Actions}}{\text{Applicable Cases}}$ | Ratio of queries where the backend executed the expected tool/worker/intent |
+| **JSON Validity** | $\frac{\text{Valid Plans}}{N}$ *(Router only)* | Ratio of requests producing structured, parsable JSON plans |
+| **Avg Latency** | $\frac{\sum \text{Latency of Completed Cases}}{\text{Completed Cases}}$ | Mean response time in seconds |
+| **Robustness** | $\frac{\text{Non-Error Runs}}{N}$ | Proportion of runs executing without runtime exceptions |
+| **Avg Fluency** | Mean of Judge Ratings (1–5) | Optional qualitative fluency score from LLM judge |
+
+---
+
+### Diagnostic Power of Disaggregated Metrics
+
+By separating **factual correctness** from **architecture routing accuracy**, the evaluation framework pinpoints exact failure modes:
+* If `Correctness = ❌` but `Arch Accuracy = ✅`: The system routed to the correct worker/tool, but the underlying tool logic or retrieval context failed to produce the expected answer.
+* If `Correctness = ❌` and `Arch Accuracy = ❌`: The supervisor or router misclassified the intent upfront.
+
+---
+
+### Honest Framework Limitations
+
+1. **Substring Matching:** Checks string presence rather than full semantic graph equivalence. High precision for deterministic tabular data, but supplemented by LLM fluency judging for natural phrasing.
+2. **Fixed Benchmark Size:** Optimized for fast, reproducible local evaluation; can be expanded to larger dataset suites.
+3. **Marker Reliance:** Refusal checks rely on predefined marker lists (`HONESTY_MARKERS`) to avoid false negatives.
 
 ---
 
