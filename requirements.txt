@@ -24,6 +24,9 @@ langchain-ollama>=0.2,<1.0
 # Backend 3 — DuckDB analytical engine
 duckdb>=1.0,<2.0
 
+# Excel support (Upload parsing)
+openpyxl>=3.1,<4.0
+
 # Frontend
 streamlit>=1.36,<2.0
 requests>=2.31,<3.0

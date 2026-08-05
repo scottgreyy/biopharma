@@ -29,7 +29,18 @@ from streamlit_app.api_client import (
     health as api_health,
     login as api_login,
     register as api_register,
+    admin_list_assets,
+    admin_get_asset,
+    admin_add_asset,
+    admin_delete_asset,
+    admin_upload,
+    admin_health,
+    chat_for_eval,
 )
+
+import asyncio
+from shared.eval.engine import run_eval
+from shared.llm.ollama_client import chat as _llm_chat
 
 # Auth targets the ReAct backend by default (auth is identical on all three).
 AUTH_BASE_URL = APPROACHES["ReAct Agent"]["base_url"]
@@ -117,9 +128,19 @@ def render_landing() -> None:
                 st.rerun()
 
     st.divider()
-    if st.button("Log out"):
-        _logout()
-        st.rerun()
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        if st.button("🗄️ Manage Data", use_container_width=True):
+            st.session_state.approach = "__admin__"
+            st.rerun()
+    with col_b:
+        if st.button("📊 Evaluation", use_container_width=True):
+            st.session_state.approach = "__eval__"
+            st.rerun()
+    with col_c:
+        if st.button("Log out", use_container_width=True):
+            _logout()
+            st.rerun()
 
 
 # --------------------------------------------------------------------------
@@ -174,6 +195,9 @@ def render_chat() -> None:
             st.warning("Backend offline", icon="⚠️")
 
         st.divider()
+        if st.button("🗄️ Manage Data", use_container_width=True):
+            st.session_state.approach = "__admin__"
+            st.rerun()
         if st.button("🏠 Back to landing", use_container_width=True):
             st.session_state.approach = None
             st.rerun()
@@ -222,6 +246,212 @@ def render_chat() -> None:
 
 
 # --------------------------------------------------------------------------
+# Screen 4: Manage Data (admin backend :8004)
+# --------------------------------------------------------------------------
+def render_admin() -> None:
+    token = st.session_state.token
+
+    with st.sidebar:
+        st.header("Navigation")
+        for label in APPROACHES:
+            if st.button(label, key=f"admin_to_{label}", use_container_width=True):
+                st.session_state.approach = label
+                st.rerun()
+        st.divider()
+        if st.button("🏠 Back to landing", use_container_width=True):
+            st.session_state.approach = None
+            st.rerun()
+        if st.button("🚪 Log out", use_container_width=True):
+            _logout()
+            st.rerun()
+
+    st.title("🗄️ Manage Data")
+    if not admin_health():
+        st.error("Admin backend is offline. Start it on port 8004 (it's part of run.bat).")
+        return
+    st.caption("View, look up, add, delete, and upload assets. Changes apply to all approaches.")
+
+    tab_view, tab_lookup, tab_add, tab_delete, tab_upload = st.tabs(
+        ["📋 View table", "🔎 Look up", "➕ Add", "🗑️ Delete", "⬆️ Upload"]
+    )
+
+    with tab_view:
+        try:
+            data = admin_list_assets(token)
+            st.caption(f"Total assets: **{data['total']}**")
+            st.dataframe(data["assets"], use_container_width=True, hide_index=True)
+        except APIError as e:
+            st.error(str(e))
+
+    with tab_lookup:
+        code = st.text_input("Asset code", key="lookup_code", placeholder="e.g. AST1002")
+        if st.button("Look up", key="lookup_btn"):
+            try:
+                row = admin_get_asset(token, code.strip())
+                st.success("Found:")
+                st.json(row)
+            except APIError as e:
+                st.warning(str(e))
+
+    with tab_add:
+        st.caption("All fields required.")
+        c1, c2 = st.columns(2)
+        with c1:
+            a_code = st.text_input("Asset Code", key="add_code")
+            a_name = st.text_input("Asset Name", key="add_name")
+            a_cat = st.text_input("Category", key="add_cat")
+        with c2:
+            a_emp = st.text_input("Employee Name", key="add_emp")
+            a_loc = st.text_input("Location", key="add_loc")
+            a_date = st.text_input("Purchase Date", key="add_date", placeholder="e.g. 18-Jan-24")
+        if st.button("Add asset", key="add_btn", type="primary"):
+            fields = {
+                "asset_code": a_code, "asset_name": a_name, "category": a_cat,
+                "employee_name": a_emp, "location": a_loc, "purchase_date": a_date,
+            }
+            if not all(v.strip() for v in fields.values()):
+                st.error("Please fill in all six fields.")
+            else:
+                try:
+                    r = admin_add_asset(token, fields)
+                    st.success(r.get("message", "Added."))
+                except APIError as e:
+                    st.error(str(e))
+
+    with tab_delete:
+        d_code = st.text_input("Asset code to delete", key="del_code", placeholder="e.g. AST1002")
+        confirm = st.checkbox("I understand this permanently deletes the row.", key="del_confirm")
+        if st.button("Delete asset", key="del_btn", type="primary", disabled=not confirm):
+            try:
+                r = admin_delete_asset(token, d_code.strip())
+                st.success(r.get("message", "Deleted."))
+            except APIError as e:
+                st.warning(str(e))
+
+    with tab_upload:
+        st.caption(
+            "Upload CSV, Excel (.xlsx/.xls), or JSON. Columns must exactly match: "
+            "Asset Code, Asset Name, Category, Employee Name, Location, Purchase Date. "
+            "If they differ, the file is refused. Existing asset codes are rejected "
+            "(no overwrite)."
+        )
+        up = st.file_uploader("Choose a file", type=["csv", "xlsx", "xls", "json"], key="uploader")
+        if up is not None and st.button("Upload & append", key="upload_btn", type="primary"):
+            try:
+                r = admin_upload(token, up.name, up.getvalue())
+                st.success(r.get("message", "Uploaded."))
+            except APIError as e:
+                st.error(str(e))
+
+
+# --------------------------------------------------------------------------
+# Screen 5: Evaluation
+# --------------------------------------------------------------------------
+def _make_judge():
+    """Optional LLM-as-judge using the same key/model. Returns fluency 1-5."""
+    def judge(question: str, answer: str) -> int:
+        prompt = (
+            "Rate the following assistant answer for clarity and helpfulness on a "
+            "scale of 1 to 5 (5 = clear, fluent, directly helpful). Reply with ONLY "
+            f"the digit.\n\nQuestion: {question}\nAnswer: {answer}\n\nScore (1-5):"
+        )
+        resp = asyncio.get_event_loop().run_until_complete(
+            _llm_chat([{"role": "user", "content": prompt}])
+        )
+        msg = resp["message"] if isinstance(resp, dict) else resp.message
+        text = (msg.get("content") if isinstance(msg, dict) else msg.content) or ""
+        for ch in text:
+            if ch in "12345":
+                return int(ch)
+        return 3
+    return judge
+
+
+def render_eval() -> None:
+    with st.sidebar:
+        st.header("Navigation")
+        for label in APPROACHES:
+            if st.button(label, key=f"eval_to_{label}", use_container_width=True):
+                st.session_state.approach = label
+                st.rerun()
+        st.divider()
+        if st.button("🏠 Back to landing", use_container_width=True):
+            st.session_state.approach = None
+            st.rerun()
+        if st.button("🚪 Log out", use_container_width=True):
+            _logout()
+            st.rerun()
+
+    st.title("📊 Evaluation")
+    st.caption(
+        "Runs a labeled question set against each backend and scores it against "
+        "ground truth. Metrics: correctness, honesty (declines unanswerable "
+        "questions), architecture accuracy (tool/routing/intent), JSON validity "
+        "(router), latency, and robustness."
+    )
+
+    choices = ["All three"] + list(APPROACHES.keys())
+    target = st.selectbox("Backend to evaluate", choices)
+    use_judge = st.checkbox(
+        "Also score answer fluency with an LLM judge (slower; uses the same model/key)",
+        value=False,
+    )
+    st.info(
+        "On free tier (concurrency 1) the calls run sequentially, so a full run "
+        "takes a few minutes per backend.", icon="⏱️",
+    )
+
+    if st.button("Run evaluation", type="primary"):
+        token = st.session_state.token
+        to_run = list(APPROACHES.keys()) if target == "All three" else [target]
+        judge = _make_judge() if use_judge else None
+        summaries = []
+
+        for backend in to_run:
+            base_url = APPROACHES[backend]["base_url"]
+
+            async def chat_fn(q, _b=base_url):
+                return chat_for_eval(_b, token, q)
+
+            with st.spinner(f"Evaluating {backend}… (this can take a few minutes)"):
+                try:
+                    summary = asyncio.run(run_eval(backend, chat_fn, judge))
+                    summaries.append(summary)
+                except Exception as e:
+                    st.error(f"{backend}: {e}")
+
+        if summaries:
+            st.subheader("Results")
+            table = []
+            for s in summaries:
+                table.append({
+                    "Backend": s.backend,
+                    "Correctness": f"{s.correctness:.0%}",
+                    "Honesty": f"{s.honesty:.0%}" if s.honesty is not None else "—",
+                    "Arch. accuracy": f"{s.arch_accuracy:.0%}" if s.arch_accuracy is not None else "—",
+                    "JSON valid": f"{s.json_validity:.0%}" if s.json_validity is not None else "—",
+                    "Avg latency": f"{s.avg_latency_s}s",
+                    "Robustness": f"{s.robustness:.0%}",
+                    "Avg fluency": f"{s.avg_fluency:.1f}/5" if s.avg_fluency is not None else "—",
+                })
+            st.dataframe(table, use_container_width=True, hide_index=True)
+
+            for s in summaries:
+                with st.expander(f"Per-question detail — {s.backend}"):
+                    rows = [{
+                        "ID": r.id, "Category": r.category,
+                        "Correct": "✅" if r.correct else "❌",
+                        "Honesty": ("✅" if r.honesty_ok else "❌") if r.honesty_ok is not None else "—",
+                        "Arch": ("✅" if r.arch_metric_ok else "❌") if r.arch_metric_ok is not None else "—",
+                        "Latency": f"{r.latency_s}s",
+                        "Question": r.question,
+                        "Answer": (r.answer[:80] + "…") if len(r.answer) > 80 else r.answer,
+                        "Error": r.error or "",
+                    } for r in s.results]
+                    st.dataframe(rows, use_container_width=True, hide_index=True)
+
+
+# --------------------------------------------------------------------------
 # Router
 # --------------------------------------------------------------------------
 def main() -> None:
@@ -230,6 +460,10 @@ def main() -> None:
         render_auth()
     elif st.session_state.approach is None:
         render_landing()
+    elif st.session_state.approach == "__admin__":
+        render_admin()
+    elif st.session_state.approach == "__eval__":
+        render_eval()
     else:
         render_chat()
 
